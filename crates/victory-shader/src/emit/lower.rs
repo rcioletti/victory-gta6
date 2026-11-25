@@ -20,6 +20,11 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+/// Packed dot-product lowering (`v_dot*`), a child module so it shares the
+/// emitter's state without growing this file.
+#[path = "dot.rs"]
+mod dot;
+
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
@@ -305,6 +310,10 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// The compare-exchanges an LDS byte or half write tries
+/// ([`Lower::lds_merge`]).
+const LDS_RETRIES: u32 = 1 << 16;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -1152,6 +1161,29 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
+/// a program that writes unordered views writes them for pixels the depth
+/// test then rejects: the title's glass prepass wrote its depth and motion
+/// for every pixel of a window pane, the character standing in front of it
+/// too, and a later pass copied those over the character's. Not for a
+/// program that exports depth, stencil or coverage (bits 0-2 and 8, or such
+/// an output), which cannot test before it runs.
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
+    // SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1257,6 +1289,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -4045,6 +4080,42 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Writes `field` over the bits of LDS dword `p` that `keep` clears, in
+    /// the lanes `guard` holds for (`ds_write_b8` / `_b16` and their `_d16_hi`
+    /// forms: LDS is dwords here). One compare-exchange, retried while another
+    /// lane changes the dword between the read and the exchange: lanes that
+    /// write other parts of one dword in the same instruction all land, no
+    /// reader sees the dword with the part cleared, and lanes that write the
+    /// same part leave one of their values, as on the console (which one is
+    /// not specified there). A clear and a set as two atomics would OR such
+    /// lanes' values together, and show the cleared part in between.
+    fn lds_merge(&mut self, p: V, keep: V, field: V, guard: Option<V>) {
+        let at = self.begin_guarded(guard);
+        let pre = self.cur;
+        let first = self.s.m.load(pre, p);
+        let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(pre, Term::Br(body));
+        let old = self.s.m.phi(body, self.s.t.i32);
+        let n = self.s.m.phi(body, self.s.t.i32);
+        let kept = self.s.m.bin(body, Bin::And, old, keep);
+        let new = self.s.m.bin(body, Bin::Or, kept, field);
+        let seen = self.s.m.cmpxchg(body, p, old, new);
+        let one = self.s.m.i32(1);
+        let next = self.s.m.bin(body, Bin::Add, n, one);
+        // Each retry follows another lane's write to the dword; the bound
+        // only keeps a translation fault from spinning the GPU.
+        let limit = self.s.m.i32(LDS_RETRIES);
+        let lost = self.s.m.cmp(body, pred::NE, seen, old);
+        let more = self.s.m.cmp(body, pred::IULT, next, limit);
+        let again = self.s.m.bin(body, Bin::And, lost, more);
+        self.s.m.terminate(body, Term::CondBr(again, body, done));
+        let zero = self.s.m.i32(0);
+        self.s.m.set_phi(old, vec![(first, pre), (seen, body)]);
+        self.s.m.set_phi(n, vec![(zero, pre), (next, body)]);
+        self.cur = done;
+        self.end_guarded(at, &[]);
+    }
+
     /// Starts code only the lanes where `guard` holds run (a store under a
     /// lane guard): returns where it started and the join block.
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
@@ -4543,8 +4614,8 @@ impl<'a> Lower<'a> {
                 };
                 self.write(inst, Reg::V(reg), x, guard);
             } else {
-                // Clear, then set: two atomics, so lanes writing other
-                // bytes of the dword keep theirs.
+                // The part replaces its bits of the dword in one
+                // compare-exchange (`lds_merge`).
                 let mut x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
                 if name != base {
                     // The data's high half.
@@ -4556,11 +4627,7 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
-                use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
-                self.s.m.atomic(self.cur, Rmw::And, p, keep);
-                self.s.m.atomic(self.cur, Rmw::Or, p, x);
-                self.end_guarded(at, &[]);
+                self.lds_merge(p, keep, x, guard);
             }
             return Ok(());
         }
@@ -6785,6 +6852,9 @@ impl<'a> Lower<'a> {
         }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
+        }
+        if name.starts_with("v_dot") {
+            return self.dot_product(inst, name, guard);
         }
         match name {
             "v_mad_u64_u32" => {

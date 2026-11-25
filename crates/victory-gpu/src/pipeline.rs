@@ -63,6 +63,7 @@ pub fn warm(stage: &'static str, container: &[u8]) -> bool {
         stage,
         hash: blake3::hash(container).to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        resolves_light: false,
         translated: OnceLock::new(),
         walks: OnceLock::new(),
     };
@@ -76,6 +77,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its result is replaced by the stand-in for indirect light
+    /// ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -130,6 +135,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: crate::ambient::resolves(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
