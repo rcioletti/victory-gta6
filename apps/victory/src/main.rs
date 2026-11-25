@@ -92,6 +92,14 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Translate the shaders of a title's archives into the cache, so that
+    /// a run finds them there.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -174,6 +182,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Warm { paths, jobs } => translate::warm_all(paths, jobs),
         Command::Run {
             exe,
             unimplemented,

@@ -54,6 +54,20 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
+/// Puts the translation of a container of the title's into the cache on
+/// disk before any run wants it (`victory warm`). Whether it translated.
+#[cfg(windows)]
+pub fn warm(stage: &'static str, container: &[u8]) -> bool {
+    // Not through the table: nothing is kept in memory.
+    let shader = Shader {
+        stage,
+        hash: blake3::hash(container).to_hex()[..16].to_owned(),
+        container: container.to_vec(),
+        translated: OnceLock::new(),
+    };
+    shader.translated().is_some()
+}
+
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
 pub(crate) struct Shader {

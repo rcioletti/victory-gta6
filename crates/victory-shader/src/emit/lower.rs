@@ -5819,7 +5819,16 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // AMD's DXIL compiler can dereference null while compiling buffer
+        // getDimensions when the heap handle is marked uniform. Use a
+        // separate nonuniform handle here without affecting ordinary accesses.
+        let per_lane = self.x.res.waterfall.loads.contains(&site);
+        let h = if image.is_none() && !per_lane {
+            let index = self.heap_index(site, first, false)?;
+            self.s.heap_handle_for_buffer_dim(self.cur, index, props)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);

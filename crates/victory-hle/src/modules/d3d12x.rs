@@ -62,6 +62,9 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+#[cfg(windows)]
+pub use victory_gpu::pipeline::warm;
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
