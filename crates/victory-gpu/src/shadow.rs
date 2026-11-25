@@ -1829,8 +1829,23 @@ fn back_piece(
     if differs == 0 {
         return None;
     }
+    mask_runs(mask, runs);
+    Some((first, n))
+}
+
+/// The runs of `mask`'s non-zero bytes, as (offset, length), into `runs`;
+/// stretches of zero words are passed over a word at a time. Where a
+/// shader wrote here and there in a piece, most of its mask is zeros: the
+/// byte-by-byte search ran at 2-4 GB/s, this at 10-27 (`mask_runs_speed`),
+/// with the same runs (`word_search_finds_the_byte_runs`).
+fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
+    let n = mask.len();
+    let zero_word = |i: usize| i + 8 <= n && mask[i..i + 8] == [0; 8];
     let mut i = 0;
     while i < n {
+        while zero_word(i) {
+            i += 8;
+        }
         while i < n && mask[i] == 0 {
             i += 1;
         }
@@ -1842,7 +1857,6 @@ fn back_piece(
             runs.push((start, i - start));
         }
     }
-    Some((first, n))
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
@@ -1972,22 +1986,68 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[inline]
+    fn all_differ_8(a: u64, b: u64) -> bool {
+        let d = a ^ b;
+        d.wrapping_sub(0x0101_0101_0101_0101) & !d & 0x8080_8080_8080_8080 == 0
+    }
+    #[inline]
+    unsafe fn load_u64(ptr: *const u8, off: usize) -> u64 {
+        unsafe { ptr.add(off).cast::<u64>().read_unaligned() }
+    }
     let n = now.len().min(was.len());
+    let (np, wp) = (now.as_ptr(), was.as_ptr());
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+        // Equal bytes: 64 bytes at a time, then 8 bytes at a time.
+        while i + 64 <= n {
+            let eq = unsafe {
+                load_u64(np, i) == load_u64(wp, i)
+                    && load_u64(np, i + 8) == load_u64(wp, i + 8)
+                    && load_u64(np, i + 16) == load_u64(wp, i + 16)
+                    && load_u64(np, i + 24) == load_u64(wp, i + 24)
+                    && load_u64(np, i + 32) == load_u64(wp, i + 32)
+                    && load_u64(np, i + 40) == load_u64(wp, i + 40)
+                    && load_u64(np, i + 48) == load_u64(wp, i + 48)
+                    && load_u64(np, i + 56) == load_u64(wp, i + 56)
+            };
+            if !eq {
+                break;
+            }
+            i += 64;
+        }
+        while i + 8 <= n && unsafe { load_u64(np, i) == load_u64(wp, i) } {
             i += 8;
         }
-        while i < n && now[i] == was[i] {
+        while i < n && unsafe { *np.add(i) == *wp.add(i) } {
             i += 1;
         }
         if i >= n {
             break;
         }
         let first = i;
-        while i < n && now[i] != was[i] {
+        // Differing bytes: 64 bytes at a time, then 8 bytes at a time.
+        while i + 64 <= n {
+            let diff = unsafe {
+                all_differ_8(load_u64(np, i), load_u64(wp, i))
+                    && all_differ_8(load_u64(np, i + 8), load_u64(wp, i + 8))
+                    && all_differ_8(load_u64(np, i + 16), load_u64(wp, i + 16))
+                    && all_differ_8(load_u64(np, i + 24), load_u64(wp, i + 24))
+                    && all_differ_8(load_u64(np, i + 32), load_u64(wp, i + 32))
+                    && all_differ_8(load_u64(np, i + 40), load_u64(wp, i + 40))
+                    && all_differ_8(load_u64(np, i + 48), load_u64(wp, i + 48))
+                    && all_differ_8(load_u64(np, i + 56), load_u64(wp, i + 56))
+            };
+            if !diff {
+                break;
+            }
+            i += 64;
+        }
+        while i + 8 <= n && unsafe { all_differ_8(load_u64(np, i), load_u64(wp, i)) } {
+            i += 8;
+        }
+        while i < n && unsafe { *np.add(i) != *wp.add(i) } {
             i += 1;
         }
         runs.push((first, i - first));
@@ -2187,6 +2247,40 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn changed_runs_matches_byte_compare() {
+        let ref_runs = |now: &[u8], was: &[u8]| {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for i in 0..now.len().min(was.len()) {
+                if now[i] != was[i] {
+                    match runs.last_mut() {
+                        Some(last) if last.0 + last.1 == i => last.1 += 1,
+                        _ => runs.push((i, 1)),
+                    }
+                }
+            }
+            runs
+        };
+        assert_eq!(changed_runs(&[], &[]), Vec::new());
+        let eq = vec![0xA5u8; 257];
+        assert_eq!(changed_runs(&eq, &eq), Vec::new());
+        let neq = vec![0x5Au8; 257];
+        assert_eq!(changed_runs(&neq, &eq), vec![(0, 257)]);
+        // Unaligned shifts across >128 bytes with mixed single/64/8-byte boundaries.
+        let base: Vec<u8> = (0..300u32).map(|i| (i * 29 + 3) as u8).collect();
+        for start_off in 0..8usize {
+            let was = &base[start_off..start_off + 200];
+            let mut now = was.to_vec();
+            for i in 10..150 {
+                now[i] ^= 0x13;
+            }
+            now[63] = was[63];
+            now[135] = was[135];
+            now[199] ^= 1;
+            assert_eq!(changed_runs(&now[start_off % 3..], &was[start_off % 3..]), ref_runs(&now[start_off % 3..], &was[start_off % 3..]));
+        }
     }
 }
 
@@ -2406,6 +2500,36 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// Idle timeout (ms) for VRAM-backed loose windows, stepping down BEFORE
+/// `host::vram_idle_ms` hits its 85% texture-eviction panic line so idle
+/// card windows yield VRAM before active textures start blinking.
+fn card_window_vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+    const NORMAL_MS: u64 = 5_000;
+    const MODERATE_MS: u64 = 2_000;
+    const HIGH_MS: u64 = 1_000;
+    let Some([budget, used, ..]) = video_memory else {
+        return NORMAL_MS;
+    };
+    if budget == 0 {
+        return NORMAL_MS;
+    }
+    let used_pct = (u128::from(used) * 100) / u128::from(budget);
+    if used_pct >= 80 {
+        HIGH_MS
+    } else if used_pct >= 70 {
+        MODERATE_MS
+    } else {
+        NORMAL_MS
+    }
+}
+
+/// Effective idle timeout (ms) for a loose window: RAM-only windows use
+/// `ram_ms`; VRAM-backed windows (`card` or GPU-upload heap) use the
+/// stricter of RAM and VRAM pressure.
+fn loose_idle_ms(ram_ms: u64, vram_ms: u64, on_card: bool) -> u64 {
+    if on_card { ram_ms.min(vram_ms) } else { ram_ms }
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -2422,6 +2546,8 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let ram_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let card_vram_ms = card_window_vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2429,10 +2555,11 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
+                let on_card = s.card.is_some() || s.uploaded != 0;
+                let idle_ms = loose_idle_ms(ram_ms, card_vram_ms, on_card);
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
@@ -2443,8 +2570,17 @@ pub(crate) fn let_go_idle() {
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+        let card_bytes: u64 = gone
+            .iter()
+            .filter(|s| s.card.is_some() || s.uploaded != 0)
+            .map(|s| s.len)
+            .sum();
         crate::host::trail(|| {
-            format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
+            format!(
+                "sweep: {went} host copies of windows of title memory let go ({} KiB, {} KiB on card), held by no list and no slot",
+                bytes >> 10,
+                card_bytes >> 10
+            )
         });
     }
     for shadow in gone {
@@ -4553,4 +4689,110 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod mask_runs_tests {
+    use super::mask_runs;
+
+    /// The byte-by-byte run search `mask_runs` replaces, kept as the
+    /// reference.
+    fn runs_bytes(mask: &[u8]) -> Vec<(usize, usize)> {
+        let (n, mut runs, mut i) = (mask.len(), Vec::new(), 0);
+        while i < n {
+            while i < n && mask[i] == 0 {
+                i += 1;
+            }
+            let start = i;
+            while i < n && mask[i] != 0 {
+                i += 1;
+            }
+            if i > start {
+                runs.push((start, i - start));
+            }
+        }
+        runs
+    }
+
+    /// A small deterministic generator (xorshift).
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Masks of every length up to 40 and some long ones, dense, sparse and
+    /// in between, runs touching word edges and the end: the same runs as
+    /// the byte-by-byte search.
+    #[test]
+    fn word_search_finds_the_byte_runs() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let lens: Vec<usize> = (0..=40).chain([63, 64, 65, 4095, 4096, 65536]).collect();
+        for &len in &lens {
+            for density in [1u64, 2, 7, 64, 4096] {
+                for _ in 0..50 {
+                    let mask: Vec<u8> = (0..len)
+                        .map(|_| {
+                            if next(&mut state).is_multiple_of(density) {
+                                (next(&mut state) as u8) | 1
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    let mut runs = Vec::new();
+                    mask_runs(&mask, &mut runs);
+                    assert_eq!(runs, runs_bytes(&mask), "length {len}, density {density}");
+                }
+            }
+        }
+    }
+
+    /// `cargo test --release -p victory-gpu --lib mask_runs_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn mask_runs_speed() {
+        const N: usize = 64 << 10;
+        for (name, every) in [
+            ("all bytes written", 1usize),
+            ("every 16th dword", 64),
+            ("1 byte per 4 KiB", 4096),
+        ] {
+            let mask: Vec<u8> = (0..N).map(|i| u8::from(i.is_multiple_of(every))).collect();
+            let time = |f: &dyn Fn(&[u8]) -> usize| {
+                let start = std::time::Instant::now();
+                for _ in 0..4000 {
+                    std::hint::black_box(f(std::hint::black_box(&mask)));
+                }
+                (4000 * N) as f64 / start.elapsed().as_secs_f64() / 1e9
+            };
+            let bytes = time(&|m| runs_bytes(m).len());
+            let words = time(&|m| {
+                let mut r = Vec::new();
+                mask_runs(m, &mut r);
+                r.len()
+            });
+            eprintln!("{name}: byte by byte {bytes:.2} GB/s, by words {words:.2} GB/s");
+        }
+    }
+}
+
+#[cfg(test)]
+mod vram_idle_tests {
+    use super::{card_window_vram_idle_ms, loose_idle_ms};
+
+    #[test]
+    fn card_window_idle_ms_tightens_before_texture_panic() {
+        assert_eq!(card_window_vram_idle_ms(None), 5_000);
+        assert_eq!(card_window_vram_idle_ms(Some([0, 0, 0, 0])), 5_000);
+        let budget = 10_000u64;
+        assert_eq!(card_window_vram_idle_ms(Some([budget, 6_999, 0, 0])), 5_000);
+        assert_eq!(card_window_vram_idle_ms(Some([budget, 7_000, 0, 0])), 2_000);
+        assert_eq!(card_window_vram_idle_ms(Some([budget, 7_999, 0, 0])), 2_000);
+        assert_eq!(card_window_vram_idle_ms(Some([budget, 8_000, 0, 0])), 1_000);
+        assert_eq!(loose_idle_ms(10_000, 1_000, false), 10_000);
+        assert_eq!(loose_idle_ms(10_000, 1_000, true), 1_000);
+        assert_eq!(loose_idle_ms(2_000, 5_000, true), 2_000);
+    }
 }

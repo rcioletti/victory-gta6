@@ -115,6 +115,11 @@ pub enum T {
 const N: usize = T::Count as usize;
 static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
+/// Reads an existing running total without resetting it.
+pub(crate) fn total(t: T) -> u64 {
+    TOTAL[t as usize].load(Relaxed)
+}
+
 /// Adds to a total.
 pub fn add(t: T, n: u64) {
     TOTAL[t as usize].fetch_add(n, Relaxed);
