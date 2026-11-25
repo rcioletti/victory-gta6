@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Submission number (`crate::host::started`) after this buffer was
+    /// allocated (see `HostTexture::born_after`).
+    born_after: u64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2267,6 +2270,11 @@ impl Shadow {
         self.id
     }
 
+    /// Submission number after which this copy's host buffer was allocated.
+    pub(crate) fn born_after(&self) -> u64 {
+        self.born_after
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -2322,6 +2330,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            born_after: crate::host::started(),
         }
     }
 

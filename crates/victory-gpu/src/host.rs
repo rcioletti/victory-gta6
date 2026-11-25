@@ -204,6 +204,16 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Submissions started so far (incremented right before each submission runs).
+pub(crate) fn started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// Submissions finished on the card so far.
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -5461,6 +5471,14 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        // Title-slot views pointing to host resources allocated while an
+        // earlier submission was on the card: settle first if a draw's table
+        // needs one now, then publish every view whose earlier submissions
+        // have finished.
+        if behind && crate::descriptor::has_required_deferred_views() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
+        crate::descriptor::flush_deferred_views();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);

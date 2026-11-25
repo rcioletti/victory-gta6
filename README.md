@@ -60,6 +60,11 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   for one frame's burst of submissions plus about 20 ms of the title's
   own; putting presents behind the line, or giving the title's threads
   more processors, changes nothing (both measured).
+- `VICTORY_MONITOR_FENCE_WAIT=1` (off by default) lets an emulated
+  `mwaitx` wait on the Windows wake word of a fence exposed by the layer.
+  The wait requests a 1 ms timeout, and fence signals can wake it sooner.
+  Compare the `monitorx` and `mwaitx` exception rates and frame times with
+  the switch on and off in the same scene on Intel.
 - Two walls stand side by side and both are full: the layer's submit
   thread (about 95 ms of a 120 ms frame in the morning) and the card
   (about 102 ms busy, by a timestamp pair around every host list:

@@ -1132,6 +1132,11 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// Submission number (`crate::host::started`) after the host texture was
+    /// allocated: a live title descriptor slot must not point at it until
+    /// earlier submissions finish (on RADV/amdgpu, a new BO's page tables are
+    /// only mapped on a later submission).
+    pub(crate) born_after: u64,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1956,6 +1961,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            born_after: crate::host::started(),
         }
     }
 
@@ -1973,6 +1979,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            born_after: crate::host::started(),
         }
     }
 }
@@ -2035,6 +2042,25 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// Submission number after which `this`'s host copy (or twin) was allocated;
+/// 0 if none is made.
+#[cfg(windows)]
+pub(crate) fn host_born_after(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    hosted(this, false).map_or(0, |(host, twin)| {
+        let mut born = host.born_after;
+        if let Some(t) = twin {
+            born = born.max(t.colour.born_after);
+            if let Some(p) = &t.plane {
+                born = born.max(p.born_after);
+            }
+        }
+        born
+    })
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -2165,12 +2191,12 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
     hosted(this, false).map(|(host, _)| host).filter(|host| host.tiled.is_some()).map(OnDemand)
 }
 
-/// The first level a view of title texture `this` may show, if its host
+/// The levels a view of title texture `this` may show, if its host
 /// copy is made level by level and some level is held and has memory
-/// (`crate::tiles::Tiled::first_shown`).
+/// (`crate::tiles::Tiled::shown_levels`).
 #[cfg(windows)]
-pub(crate) fn first_shown(this: This) -> Option<u32> {
-    host_tiled(this)?.tiled()?.first_shown()
+pub(crate) fn shown_levels(this: This) -> u32 {
+    host_tiled(this).and_then(|host| host.tiled().map(|tiles| tiles.shown_levels())).unwrap_or(0)
 }
 
 /// A host copy made without memory of its own (`crate::tiles`), as a

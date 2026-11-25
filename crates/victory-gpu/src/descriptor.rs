@@ -277,6 +277,45 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    let deferred = host::DEFERRED_VIEWS[0].swap(0, std::sync::atomic::Ordering::Relaxed);
+    let flushed = host::DEFERRED_VIEWS[1].swap(0, std::sync::atomic::Ordering::Relaxed);
+    if deferred > 0 || flushed > 0 {
+        tracing::info!(
+            "new-resource title-slot views held back until earlier submissions finished (VICTORY_DEFER_NEW_VIEWS=0: immediate): \
+             {deferred} deferred, {flushed} published"
+        );
+    }
+}
+
+/// Whether any shader-visible heap has a deferred title-slot view that a
+/// non-fresh draw table requires before the next submission runs.
+#[cfg(windows)]
+pub(crate) fn has_required_deferred_views() -> bool {
+    let finished = crate::host::finished();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps.iter().any(|&(_, _, h)| {
+        // SAFETY: registered heaps are live (removed in `Drop`).
+        let heap = unsafe { &*(h as *const Heap) };
+        heap.host
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|host| host.has_required_deferred(finished))
+    })
+}
+
+/// Publishes deferred title-slot views whose backing host resource is now
+/// older than `crate::host::finished()`.
+#[cfg(windows)]
+pub(crate) fn flush_deferred_views() {
+    let finished = crate::host::finished();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, h) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed in `Drop`).
+        let heap = unsafe { &*(h as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.flush_deferred(finished);
+        }
+    }
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
