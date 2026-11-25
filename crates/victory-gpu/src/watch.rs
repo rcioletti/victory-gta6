@@ -24,7 +24,7 @@
 //! system call writing into a guarded block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -70,6 +70,11 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// With [`unlocked`]: tickets handed to kernel askings made without
+    /// the lock, and those not landed (their pages not yet noted here),
+    /// with the page range each asks about.
+    flight: u64,
+    flying: BTreeMap<u64, (usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -79,7 +84,81 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    flight: 0,
+    flying: BTreeMap::new(),
 });
+
+/// Woken when an asking made without the lock lands ([`unlocked`]).
+static LANDED: Condvar = Condvar::new();
+
+/// The journal, the wait for it counted on the frame line.
+fn journal() -> MutexGuard<'static, Journal> {
+    match JOURNAL.try_lock() {
+        Ok(j) => return j,
+        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    let asked = std::time::Instant::now();
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    crate::framelog::add(crate::framelog::T::JournalWaitUs, micros(asked));
+    j
+}
+
+/// Microseconds since `from`, rounded up.
+fn micros(from: std::time::Instant) -> u64 {
+    (from.elapsed().as_nanos() as u64).div_ceil(1000)
+}
+
+/// A kernel asking of `us` microseconds, made with the lock `held` or not.
+fn kernel_asked(us: u64, held: bool) {
+    use crate::framelog::{T, add};
+    add(T::JournalAsks, 1);
+    add(T::JournalAskUs, us);
+    if held {
+        add(T::JournalHeldUs, us);
+    }
+}
+
+/// Whether [`writes`] asks the kernel with the journal's lock let go
+/// (`VICTORY_JOURNAL_UNLOCKED=1`; off by default).
+///
+/// The lock was held across the kernel's asking, and an asking over big
+/// memory takes milliseconds (some 5 ms for 1 GB with its pages reset, on
+/// an i5-12400F; 6-21 ms in run 76, behind other walks of the page
+/// tables). The queues prepare their submissions each on its own thread,
+/// and every answer of the journal waited for it, those the journal gives
+/// alone too (ranges asked ahead, [`asked`]).
+///
+/// With the switch the asking holds a ticket instead. An answer, of the
+/// journal alone or after an asking of its own, waits for the tickets
+/// handed before it over any of its pages to land: an asking in flight may
+/// have reset the bits of pages written before the answer, which another
+/// asking then does not see, and the answer must have them. Askings over
+/// other memory are not waited for. The numbers keep their meaning: an
+/// answer's is the journal's last, every page in it was found before the
+/// answer, and a page written after is found by an asking that lands
+/// after, with a higher one. Asking ahead ([`ask_ahead`], [`ask_once`])
+/// and view memory (the guards) are as they were.
+fn unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOURNAL_UNLOCKED").is_some_and(|v| v == "1"))
+}
+
+/// `j` once the askings made without the lock over any of pages
+/// `[first, last)` that hold tickets handed before now have landed.
+fn landed(mut j: MutexGuard<'static, Journal>, first: usize, last: usize) -> MutexGuard<'static, Journal> {
+    let upto = j.flight;
+    let flying = |j: &Journal| j.flying.range(..upto).any(|(_, &(a, b))| a < last && first < b);
+    if !flying(&j) {
+        return j;
+    }
+    let waiting = std::time::Instant::now();
+    while flying(&j) {
+        j = LANDED.wait(j).unwrap_or_else(|e| e.into_inner());
+    }
+    crate::framelog::add(crate::framelog::T::JournalLandUs, micros(waiting));
+    j
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -105,7 +184,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -176,7 +255,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept {
         j.ahead.clear();
     }
@@ -215,7 +294,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -251,7 +330,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -262,7 +341,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept || len == 0 {
         return;
     }
@@ -288,7 +367,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// last found `page` written (0: never) and the new one, for the copy
 /// that wrote to note itself current.
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     j.asked += 1;
     let now = j.asked;
@@ -334,7 +413,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -347,6 +425,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    kernel_asked(micros(started), true);
     if failed {
         return false;
     }
@@ -372,11 +451,49 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    let j = landed(journal(), first, last);
+    covers(&j, first, last).then(|| (j.ahead_asked, pages_of(&j, first, last)))
+}
+
+/// Whether pages `[first, last)` lie in a range asked ahead.
+fn covers(j: &Journal, first: usize, last: usize) -> bool {
+    j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+}
+
+/// The journal's pages of `[first, last)` with the asking that last found
+/// each written.
+fn pages_of(j: &Journal, first: usize, last: usize) -> Vec<(usize, u64)> {
+    j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+}
+
+thread_local! {
+    /// Room for the kernel's answer to an asking made without the lock.
+    static FOUND: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// The kernel's written pages of pages `[first, last)`, reset, into
+/// `found`: how many, or `None` if the range is not write-watched memory
+/// of one reservation.
+fn ask(first: usize, last: usize, found: &mut Vec<usize>) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    if found.len() < count {
+        found.resize(count, 0);
+    }
+    let mut granularity = 0;
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    (!failed).then_some(count)
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -385,42 +502,58 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    writes_as(start, end, guarded, unlocked())
+}
+
+/// [`writes`], the kernel asked with the lock let go if `unlocked`.
+fn writes_as(start: usize, end: usize, guarded: bool, unlocked: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut j = journal();
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+    if covers(&j, first, last) {
+        j = landed(j, first, last);
+        if covers(&j, first, last) {
+            return Some((j.ahead_asked, pages_of(&j, first, last)));
+        }
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view
-        || unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
+    let unlocked = unlocked && !known_view;
+    let (found, count) = if known_view {
+        (std::mem::take(&mut j.found), None)
+    } else if unlocked {
+        let ticket = j.flight;
+        j.flight += 1;
+        j.flying.insert(ticket, (first, last));
+        drop(j);
+        let mut found = FOUND.take();
+        let asking = std::time::Instant::now();
+        let count = ask(first, last, &mut found);
+        kernel_asked(micros(asking), false);
+        j = journal();
+        j.flying.remove(&ticket);
+        LANDED.notify_all();
+        (found, count)
+    } else {
+        let mut found = std::mem::take(&mut j.found);
+        let asking = std::time::Instant::now();
+        let count = ask(first, last, &mut found);
+        kernel_asked(micros(asking), true);
+        (found, count)
+    };
+    // The answer buffer back where it was taken from.
+    let give_back = |j: &mut Journal, found: Vec<usize>| {
+        if unlocked {
+            FOUND.set(found);
+        } else if found.len() > j.found.len() {
+            j.found = found;
+        }
+    };
+    let failed = count.is_none();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -435,8 +568,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         failed_asking(first * PAGE, last * PAGE);
     }
     let guarded = if failed {
-        count = 0;
         if !guarded {
+            give_back(&mut j, found);
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -444,7 +577,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
+        let Some(written) = written else {
+            give_back(&mut j, found);
+            return None;
+        };
+        written
     } else {
         Vec::new()
     };
@@ -457,17 +594,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for &at in &found[..count.unwrap_or(0)] {
+        j.written.insert(at / PAGE, now);
+    }
+    for page in guarded {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    give_back(&mut j, found);
+    // What askings in flight over these pages reset is noted before the
+    // answer ([`unlocked`]); with none, the answer is this asking's.
+    let j = landed(j, first, last);
+    Some((j.asked, pages_of(&j, first, last)))
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -1061,13 +1198,28 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+/// ([`title_memory_remapping`]): the lock, or nothing when this thread
+/// already held it.
+pub struct Remapping(#[allow(dead_code)] Option<std::sync::RwLockWriteGuard<'static, ()>>, std::time::Instant);
+
+thread_local! {
+    /// How many [`Remapping`]s this thread holds. A thread that holds the
+    /// lock for a whole batch of page mappings (`queue::copy_page_mappings`
+    /// with `VICTORY_REMAP_BATCH=1`) asks for it again for each page (the
+    /// runtime's `map_alias`), and must not wait for itself: before, no
+    /// thread ever asked twice (the lock is not reentrant, and that would
+    /// have hung).
+    static REMAPPING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
-        // From asking for the lock until it is let go (the frame log).
-        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        REMAPPING.with(|d| d.set(d.get().saturating_sub(1)));
+        // From asking for the lock until it is let go (the frame log); the
+        // outermost holder alone, so a batch is counted once.
+        if self.0.is_some() {
+            crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        }
     }
 }
 
@@ -1077,10 +1229,17 @@ impl Drop for Remapping {
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
     let asked = std::time::Instant::now();
-    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     crate::framelog::add(crate::framelog::T::Remaps, 1);
+    // Held already by this thread (a batch of page mappings): nothing to
+    // wait for.
+    if REMAPPING.with(|d| d.get()) > 0 {
+        REMAPPING.with(|d| d.set(d.get() + 1));
+        return Remapping(None, asked);
+    }
+    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    REMAPPING.with(|d| d.set(d.get() + 1));
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
-    Remapping(held, asked)
+    Remapping(Some(held), asked)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -1746,5 +1905,190 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::{PAGE, ask_ahead, ask_ahead_done, asked, writes_as};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Write-watched memory of `pages` pages, committed; freed on drop.
+    struct Watched(usize);
+
+    impl Watched {
+        fn new(pages: usize) -> Self {
+            // SAFETY: a fresh allocation of ours.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), pages * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            assert!(!p.is_null());
+            Self(p as usize)
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            // SAFETY: our allocation, no longer used.
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    fn xorshift(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// No write is lost, the kernel asked with the lock held or let go: a
+    /// write to a page that began after an asker's answer and ended before
+    /// its next asking shows in that next answer, at a number above the
+    /// first answer's. Askers ask overlapping ranges, so each one's kernel
+    /// asking resets bits another needs; one of them asks ahead and answers
+    /// from the journal.
+    #[test]
+    fn no_write_is_lost_with_the_lock_held_or_let_go() {
+        const PAGES: usize = 64;
+        const WRITERS: usize = 2;
+        for unlocked in [false, true] {
+            let memory = Arc::new(Watched::new(PAGES));
+            let base = memory.0;
+            // Per page: writes begun, writes done (one writer per page).
+            let begun: Arc<Vec<AtomicU64>> = Arc::new((0..PAGES).map(|_| AtomicU64::new(0)).collect());
+            let done: Arc<Vec<AtomicU64>> = Arc::new((0..PAGES).map(|_| AtomicU64::new(0)).collect());
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut threads = Vec::new();
+            for w in 0..WRITERS {
+                let (begun, done, stop, memory) = (begun.clone(), done.clone(), stop.clone(), memory.clone());
+                threads.push(std::thread::spawn(move || {
+                    let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ w as u64;
+                    while !stop.load(SeqCst) {
+                        let p = (xorshift(&mut x) as usize % (PAGES / WRITERS)) * WRITERS + w;
+                        begun[p].fetch_add(1, SeqCst);
+                        let at = memory.0 + p * PAGE + (xorshift(&mut x) as usize % (PAGE / 8)) * 8;
+                        // SAFETY: inside our committed memory; each page has one writer.
+                        unsafe { std::ptr::write_volatile(at as *mut u64, x) };
+                        done[p].fetch_add(1, SeqCst);
+                    }
+                }));
+            }
+            // Askers: first page, last page, whether it asks ahead.
+            let askers = [(0, PAGES, false), (0, PAGES / 2, false), (PAGES / 4, 3 * PAGES / 4, false), (7, 9, false), (PAGES / 2, PAGES, true)];
+            let checked = Arc::new(AtomicU64::new(0));
+            let mut askings = Vec::new();
+            for (first, last, ahead) in askers {
+                let (begun, done, stop, checked) = (begun.clone(), done.clone(), stop.clone(), checked.clone());
+                askings.push(std::thread::spawn(move || {
+                    let (start, end) = (base + first * PAGE, base + last * PAGE);
+                    let answer = || {
+                        if ahead {
+                            ask_ahead(&[(start, start + PAGE), (start + PAGE, end)]);
+                            let got = asked(start, end).or_else(|| writes_as(start, end, false, unlocked));
+                            ask_ahead_done();
+                            got
+                        } else {
+                            writes_as(start, end, false, unlocked)
+                        }
+                    };
+                    let (mut before, _) = answer().expect("watched");
+                    let mut begun_after: Vec<u64> = (first..last).map(|p| begun[p].load(SeqCst)).collect();
+                    while !stop.load(SeqCst) {
+                        let done_before: Vec<u64> = (first..last).map(|p| done[p].load(SeqCst)).collect();
+                        let (now, pages) = answer().expect("watched");
+                        for (k, p) in (first..last).enumerate() {
+                            if done_before[k] > begun_after[k] {
+                                let page = base / PAGE + p;
+                                let w = pages.iter().find(|e| e.0 == page).map_or(0, |e| e.1);
+                                assert!(
+                                    w > before,
+                                    "unlocked {unlocked}: page {p} was written after the answer at {before} and before the next, \
+                                     which says it was last written at {w}"
+                                );
+                                checked.fetch_add(1, SeqCst);
+                            }
+                        }
+                        // An answer of the journal alone gives the number of the
+                        // asking ahead, below pages other askings found since.
+                        assert!(ahead || pages.iter().all(|e| e.1 <= now), "unlocked {unlocked}: an answer's number is below a page in it");
+                        before = now;
+                        begun_after = (first..last).map(|p| begun[p].load(SeqCst)).collect();
+                    }
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+            stop.store(true, SeqCst);
+            for t in threads.into_iter().chain(askings) {
+                t.join().unwrap();
+            }
+            assert!(checked.load(SeqCst) > 100, "too few writes were checked: {}", checked.load(SeqCst));
+        }
+    }
+
+    /// Measures what a small asking waits for while another thread asks
+    /// about 1 GB of write-watched memory, the lock held across the
+    /// kernel's asking or let go. Run with
+    /// `cargo test -p victory-gpu --release journal_tests::what -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn what_a_small_asking_waits_for_beside_a_big_one() {
+        const BIG: usize = (1 << 30) / PAGE;
+        let big = Watched::new(BIG);
+        let small = Watched::new(4);
+        for unlocked in [false, true, false, true] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let start = Arc::new(Barrier::new(2));
+            let (big_at, small_at) = (big.0, small.0);
+            let asker = {
+                let (stop, start) = (stop.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let mut x = 1u64;
+                    let (mut n, mut us) = (0u64, 0u64);
+                    while !stop.load(SeqCst) {
+                        // A tenth of the pages written, as streaming does.
+                        for _ in 0..BIG / 10 {
+                            let at = big_at + (xorshift(&mut x) as usize % BIG) * PAGE;
+                            // SAFETY: inside our committed memory.
+                            unsafe { std::ptr::write_volatile(at as *mut u8, 1) };
+                        }
+                        let t = Instant::now();
+                        writes_as(big_at, big_at + BIG * PAGE, false, unlocked).expect("watched");
+                        us += t.elapsed().as_micros() as u64;
+                        n += 1;
+                    }
+                    (n, us)
+                })
+            };
+            start.wait();
+            let mut lat: Vec<u64> = Vec::new();
+            let until = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < until {
+                // SAFETY: inside our committed memory.
+                unsafe { std::ptr::write_volatile(small_at as *mut u8, 1) };
+                let t = Instant::now();
+                writes_as(small_at, small_at + 4 * PAGE, false, unlocked).expect("watched");
+                lat.push(t.elapsed().as_nanos() as u64);
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            stop.store(true, SeqCst);
+            let (n, us) = asker.join().unwrap();
+            lat.sort_unstable();
+            let q = |f: f64| lat[((lat.len() - 1) as f64 * f) as usize] as f64 / 1e3;
+            let total: u64 = lat.iter().sum();
+            println!(
+                "lock {}: big askings {n}, {:.2} ms each | small askings {}: median {:.1} us, p99 {:.1} us, longest {:.1} us, \
+                 all together {:.1} ms over 3 s",
+                if unlocked { "let go" } else { "held  " },
+                us as f64 / n.max(1) as f64 / 1e3,
+                lat.len(),
+                q(0.5),
+                q(0.99),
+                q(1.0),
+                total as f64 / 1e6
+            );
+        }
     }
 }

@@ -70,6 +70,15 @@ pub enum T {
     Uploads,
     /// Waiting for host pipelines being made.
     PipelineWaitUs,
+    /// The write-watch journal (`crate::watch`): kernel askings and their
+    /// time, of it the time asked with the journal's lock held; the time
+    /// threads waited for that lock, and (`VICTORY_JOURNAL_UNLOCKED=1`)
+    /// for other threads' askings to land before answering.
+    JournalAsks,
+    JournalAskUs,
+    JournalHeldUs,
+    JournalWaitUs,
+    JournalLandUs,
     /// Writes taken by the guards on view memory.
     GuardFaults,
     /// The title's frame waits: time slept, on every thread.
@@ -412,7 +421,8 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers) | journal: {:.0} askings {:.1} ms ({:.1} with the lock held), {:.1} ms waiting for the lock, {:.1} \
+         for other askings to land | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
@@ -454,6 +464,11 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        t(T::JournalAsks),
+        ms(T::JournalAskUs),
+        ms(T::JournalHeldUs),
+        ms(T::JournalWaitUs),
+        ms(T::JournalLandUs),
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),

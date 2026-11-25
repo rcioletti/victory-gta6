@@ -16,6 +16,7 @@ use crate::host::host;
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -26,6 +27,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Lock-free atomic mirror of `made` for the ~98% cache-hit path in
+    /// `HostHeap::mirror` (written under `made`'s lock with Release ordering).
+    made_fast: Vec<std::sync::atomic::AtomicU64>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -994,11 +998,13 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1476,6 +1482,7 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
@@ -1814,10 +1821,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -2053,6 +2058,15 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Lock-free fast path (~98% hit rate on draw/pass lookups): avoid
+        // locking `self.made` when the host slot is already up to date.
+        if tag == VIEW_TAG
+            && key != 0
+            && self.made_fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -2060,6 +2074,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -2107,6 +2122,7 @@ impl HostHeap {
                     null_for(&view, self.cpu(index));
                 }
                 self.keep(index, None);
+                self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
             } else {
                 let max_born = defer_new_views().then(crate::host::finished);
                 match make_checked(&view, self.cpu(index), max_born) {
@@ -2124,6 +2140,7 @@ impl HostHeap {
                     Make::Made(kept) => {
                         made[index as usize] = key;
                         self.keep(index, kept);
+                        self.made_fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
                     }
                     Make::None => {
                         made[index as usize] = key;
@@ -2131,6 +2148,7 @@ impl HostHeap {
                             null_for(&view, self.cpu(index));
                         }
                         self.keep(index, None);
+                        self.made_fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
                     }
                 }
             }
