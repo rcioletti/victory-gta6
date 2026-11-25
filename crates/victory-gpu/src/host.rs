@@ -2786,9 +2786,28 @@ mod fill_ahead {
 
     static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
 
+    /// 0 = auto (ahead until a flight changes bytes a fill read, default),
+    /// 1 = always wait (`VICTORY_FILL_WAIT=1`),
+    /// 2 = never latch wait (`VICTORY_FILL_WAIT=0`; still counts & warns once).
+    fn parse_fill_wait_mode(val: Option<&str>) -> u8 {
+        match val {
+            Some("1") => 1,
+            Some("0") => 2,
+            _ => 0,
+        }
+    }
+
+    fn mode() -> u8 {
+        static MODE: OnceLock<u8> = OnceLock::new();
+        *MODE.get_or_init(|| parse_fill_wait_mode(std::env::var("VICTORY_FILL_WAIT").ok().as_deref()))
+    }
+
     pub(super) fn on() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+        match mode() {
+            1 => false,
+            2 => true,
+            _ => !WAIT.load(Relaxed),
+        }
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -2814,7 +2833,7 @@ mod fill_ahead {
     /// A landing is about to put `new` into title memory at `at`: bytes
     /// shaders wrote, merged into the title's.
     pub(crate) fn wrote(at: usize, new: &[u8]) {
-        if new.is_empty() || WAIT.load(Relaxed) {
+        if new.is_empty() || !on() {
             return;
         }
         let frame = crate::frame::current();
@@ -2846,7 +2865,17 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
-            if !WAIT.swap(true, Relaxed) {
+            if mode() == 2 {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Relaxed) {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
+                         them (first at {:#x}, landed in frame {frame}): keeping fills ahead because VICTORY_FILL_WAIT=0 ({n} such fills)",
+                        to - from,
+                        a + first
+                    );
+                }
+            } else if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
                      them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
@@ -2885,6 +2914,19 @@ mod fill_ahead {
             COUNT[2].load(Relaxed),
             if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_fill_wait_mode;
+
+        #[test]
+        fn fill_wait_mode_parses_default_wait_and_force_ahead() {
+            assert_eq!(parse_fill_wait_mode(None), 0);
+            assert_eq!(parse_fill_wait_mode(Some("1")), 1);
+            assert_eq!(parse_fill_wait_mode(Some("0")), 2);
+            assert_eq!(parse_fill_wait_mode(Some("other")), 0);
+        }
     }
 }
 
