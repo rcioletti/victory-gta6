@@ -100,13 +100,18 @@ pub(crate) fn on() -> bool {
 /// under [`LEAST`] bytes, since the last line.
 static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-/// The fewest bytes copied in place. A read of a byte or a word is how the
-/// layer ASKS whether a page is there (a texture's first page, a record):
-/// it is expected to fail, and a failed kernel read costs a microsecond
-/// where a fault and its handler cost tens (run 230: 1,000 to 1,300 faults
-/// a frame, nearly all of them such askings, took back most of what the
-/// copies in place had won).
+/// The fewest bytes copied in place by [`copy`] (`read_into`). A read of a
+/// byte or a word is how the layer ASKS whether a page is there (a texture's
+/// first page, a record): it is expected to fail, and a failed kernel read
+/// costs a microsecond where a fault and its handler cost tens (run 230:
+/// 1,000 to 1,300 faults a frame, nearly all of them such askings, took back
+/// most of what the copies in place had won).
 const LEAST: usize = 256;
+
+/// The fewest bytes copied in place by [`copy_data`] (`copy_mapped`), where
+/// real buffer/upload copies under 256 bytes (e.g. 64-byte constant updates)
+/// are expected to have committed sources and otherwise avoid `NtReadVirtualMemory`.
+const LEAST_DATA: usize = 16;
 
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:
 /// their copies go straight to the kernel's, which reads round the hole.
@@ -255,13 +260,13 @@ pub(crate) fn write(to: *mut u8, from: *const u8, len: usize) -> bool {
 }
 
 /// With [`on`]: copies title memory at `from` into host memory at `to`;
-/// false if it is off or a source page was not there (the caller then
-/// copies through the kernel, as before).
-pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
+/// false if it is off, smaller than `least`, or a source page was not there
+/// (the caller then copies through the kernel, as before).
+fn copy_min(to: *mut u8, from: *const u8, len: usize, least: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if len < least {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }
@@ -278,6 +283,20 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         note_fault(from as usize, len);
     }
     whole
+}
+
+/// With [`on`]: copies title memory at `from` into host memory at `to` for
+/// probes/reads that may expect missing pages (`LEAST = 256`); false if off
+/// or a source page was not there.
+pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
+    copy_min(to, from, len, LEAST)
+}
+
+/// With [`on`]: copies real buffer/upload data of at least `LEAST_DATA = 16`
+/// bytes from `from` into host memory at `to`; false if off or a source page
+/// was not there.
+pub(crate) fn copy_data(to: *mut u8, from: *const u8, len: usize) -> bool {
+    copy_min(to, from, len, LEAST_DATA)
 }
 
 /// With the frame line: what [`copy`] did per frame over `frames`.
@@ -412,6 +431,25 @@ mod tests {
         // Caller-saved registers intact: valid write still succeeds.
         assert!(guarded_write(base, src.as_ptr(), PAGE));
         // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn small_data_copies_succeed_above_threshold_and_fault_cleanly_on_holes() {
+        assert_eq!(LEAST_DATA, 16);
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        assert!(!base.is_null());
+        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let src = unsafe { std::slice::from_raw_parts_mut(base, PAGE) };
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13);
+        }
+        for len in [16usize, 64, 128] {
+            let mut to = vec![0u8; len];
+            assert!(guarded(to.as_mut_ptr(), base, len));
+            assert_eq!(&to[..], &src[..len]);
+            assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE), len));
+        }
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 }

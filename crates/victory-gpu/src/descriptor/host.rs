@@ -2026,11 +2026,6 @@ impl HostHeap {
             return false;
         }
         let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
-        let print = record_print(record) | 1;
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -2039,8 +2034,16 @@ impl HostHeap {
             let Some(last) = copied.get_mut(index as usize) else {
                 return false;
             };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
+            // A slot never looked at that holds nothing: skip hashing it.
+            if *last == 0 && record_is_zero(&record[..n]) {
+                return false;
+            }
+            // Never 0, which is "never looked at". (A multiply-and-fold over
+            // the record's words: BLAKE3 here was most of the 35 to 42 ms a
+            // frame this pass took over some 250,000 to 300,000 records, run
+            // 200.)
+            let print = record_print(record) | 1;
+            if *last == print {
                 return false;
             }
             *last = print;
@@ -2098,11 +2101,13 @@ impl HostHeap {
                 let Some(last) = copied.get_mut(index as usize) else {
                     continue;
                 };
+                // A slot never looked at that holds nothing: skip hashing it.
+                if *last == 0 && record_is_zero(record) {
+                    continue;
+                }
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                if *last == print {
                     continue;
                 }
                 // A table's slot lately: left to its draws, and looked at
@@ -2642,7 +2647,26 @@ pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomi
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
-/// print about once in 2^64. Not a hash anyone can attack: the records
+/// Returns `true` when every byte of `record` is `0`, scanning 64-bit words
+/// at a time so untouched descriptor heap slots can be skipped without hashing.
+#[inline]
+fn record_is_zero(record: &[u8]) -> bool {
+    let mut acc = 0u64;
+    let mut words = record.chunks_exact(8);
+    for word in &mut words {
+        acc |= u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]));
+    }
+    let mut tail = 0u8;
+    for &b in words.remainder() {
+        tail |= b;
+    }
+    acc == 0 && tail == 0
+}
+
+/// A 64-bit fingerprint of a descriptor record: deterministic, so two
+/// processes print alike, and cheap enough to compute for every record on
+/// a changed heap page. Two records differ in their bytes and produce the
+/// same print about once in 2^64. Not a hash anyone can attack: the records
 /// are our own.
 fn record_print(record: &[u8]) -> u64 {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -4177,7 +4201,7 @@ mod tests {
 
 #[cfg(test)]
 mod record_print_tests {
-    use super::record_print;
+    use super::{record_is_zero, record_print};
 
     /// Equal records print alike; a record that differs in any one byte,
     /// or in its length, prints otherwise.
@@ -4197,6 +4221,21 @@ mod record_print_tests {
         assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
         // A record of zeros is told from "never looked at" by the caller's `| 1`.
         assert_ne!(record_print(&[0u8; 32]) | 1, 0);
+    }
+
+    #[test]
+    fn record_is_zero_detects_zeros_and_single_bits() {
+        for len in [16usize, 32, 64] {
+            let zeros = vec![0u8; len];
+            assert!(record_is_zero(&zeros));
+            for at in 0..len {
+                for bit in 0..8 {
+                    let mut buf = zeros.clone();
+                    buf[at] = 1 << bit;
+                    assert!(!record_is_zero(&buf), "len {len} byte {at} bit {bit}");
+                }
+            }
+        }
     }
 }
 
