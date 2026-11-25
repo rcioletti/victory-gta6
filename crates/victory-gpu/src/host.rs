@@ -121,12 +121,13 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
+/// scaled down under VRAM pressure. Never returns less than 5,000 ms so
+/// long world-loading frames (4s+) and uncounted `host_resource()` borrows
+/// remain protected across in-flight submissions.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    const NORMAL_MS: u64 = 10_000;
+    const MODERATE_MS: u64 = 7_500;
+    const HIGH_MS: u64 = 5_000;
     let Some([budget, used, ..]) = video_memory else {
         return NORMAL_MS;
     };
@@ -217,11 +218,14 @@ pub(crate) fn finished() -> u64 {
     FINISHED.load(Ordering::Acquire)
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// Drops `object` once two more submissions have finished on the card (at once
+/// only when `started == 0` in device-free unit tests). Deferring every live
+/// GPU resource release past `started + 2` keeps handles used by queued
+/// command lists or uncounted lookups alive across submission boundaries and
+/// pushes `NtGdiDdDDIDestroyAllocation2` work off the submit thread onto `bury()`.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    if started == 0 {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -230,7 +234,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+        .push((started.saturating_add(2), Retired(Box::new(object))));
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -9257,18 +9261,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use super::vram_idle_ms;
         let gib = 1024 * 1024 * 1024;
         // Normal (< 75%)
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 10_000);
         // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 7_500);
+        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 7_500);
         // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 5_000);
         // Missing or zero budget falls back to normal
-        assert_eq!(vram_idle_ms(None), 5_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(None), 10_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 10_000);
     }
 
     #[test]
