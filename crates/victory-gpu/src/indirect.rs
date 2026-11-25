@@ -474,11 +474,14 @@ fn record_clamp_as(
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    let second = [transition(
-        dst,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-    )];
+    let second = [
+        uav_barrier(),
+        transition(
+            dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ),
+    ];
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -493,9 +496,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        // Transitioning `dst` from UNORDERED_ACCESS to INDIRECT_ARGUMENT
-        // already synchronizes our clamp's UAV writes without a global UAV stall.
-        l.ResourceBarrier(&second);
+        l.ResourceBarrier(&second[skip..]);
     }
     true
 }
@@ -1186,7 +1187,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES.min(65535), 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1260,7 +1261,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces.min(65535), 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
@@ -1315,6 +1316,203 @@ void main() {
         piece0[5] ^= 1;
         piece0[9] ^= 2;
         assert_eq!(slot(PIECE - SKEW as usize), piece0);
+    }
+
+    /// Coalesced `CARD_COMPARE` (64 threads per 64 KiB piece) handles
+    /// non-aligned `skew`, non-zero `first` and `out_at`, single-byte
+    /// mutations in every lane (`0..64`), and simultaneous identical lane
+    /// mutations without cancellation, on both WARP and the hardware GPU
+    /// (with zero D3D12 debug-layer warnings or errors).
+    #[test]
+    fn warp_card_compare_coalesced_lanes_and_skew() {
+        const PIECE: usize = 64 << 10;
+        const FULL_PIECES: u32 = 4;
+        const SKEW: u32 = 1003;
+        let size = PIECE * FULL_PIECES as usize;
+        let pieces = FULL_PIECES + 1;
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+
+        let assert_clean_debug = |device: &ID3D12Device| {
+            let Ok(queue) = device.cast::<ID3D12InfoQueue>() else {
+                return;
+            };
+            // SAFETY: reading and clearing stored D3D12 debug-layer messages.
+            unsafe {
+                for i in 0..queue.GetNumStoredMessages() {
+                    let mut len = 0;
+                    if queue.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u64; len.div_ceil(8)];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if queue.GetMessage(i, Some(msg), &mut len).is_ok() {
+                        let m = &*msg;
+                        if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                            let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                            panic!(
+                                "D3D12 debug layer warning/error (severity {}): {}",
+                                m.Severity.0,
+                                String::from_utf8_lossy(text).trim_end_matches('\0')
+                            );
+                        }
+                    }
+                }
+                queue.ClearStoredMessages();
+            }
+        };
+
+        let exercise = |now_ptr: *mut u8,
+                        differs_ptr: *mut u32,
+                        run: &mut dyn FnMut(u32, u32, u32, u32, u32, u32)| {
+            // SAFETY: `now_ptr` holds `size` bytes and `differs_ptr` holds at least 8 dwords.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+            let read_differs = |at_dwords: usize, count: usize| -> Vec<u32> {
+                // SAFETY: inside `differs_ptr` mapping.
+                (0..count).map(|i| unsafe { differs_ptr.add(at_dwords + i).read_volatile() }).collect()
+            };
+            let clear_differs = || {
+                for i in 0..8 {
+                    // SAFETY: inside `differs_ptr` mapping.
+                    unsafe { differs_ptr.add(i).write_volatile(7) };
+                }
+            };
+            let flip = |at: usize, mask: u8| {
+                // SAFETY: `at < size` inside `now_ptr` mapping.
+                unsafe {
+                    let cur = now_ptr.add(at).read_volatile();
+                    now_ptr.add(at).write_volatile(cur ^ mask);
+                }
+            };
+
+            clear_differs();
+            run(0, SKEW, size as u32, pieces, 0, 0);
+            assert_eq!(read_differs(0, pieces as usize), vec![7; pieces as usize]);
+            run(0, SKEW, size as u32, pieces, 0, 1);
+            assert_eq!(read_differs(0, pieces as usize), vec![0; pieces as usize]);
+
+            // Piece 0 bounds: `[0, PIECE - SKEW)`, testing lane 0, lane 1, lane 62,
+            // strictly inside piece 0 (`64527`), and the shared 16-byte boundary (`64532`).
+            let p0_only_end = ((PIECE - SKEW as usize) & !15) - 1;
+            let p0_shared_end = PIECE - SKEW as usize - 1;
+            for (at, expected) in [
+                (0usize, [1, 0, 0, 0, 0]),
+                (16, [1, 0, 0, 0, 0]),
+                (1000, [1, 0, 0, 0, 0]),
+                (p0_only_end, [1, 0, 0, 0, 0]),
+                (p0_shared_end, [1, 1, 0, 0, 0]),
+            ] {
+                flip(at, 0x01);
+                run(0, SKEW, size as u32, pieces, 0, 1);
+                assert_eq!(read_differs(0, pieces as usize), expected, "piece 0 byte {at}");
+                flip(at, 0x01);
+                run(0, SKEW, size as u32, pieces, 0, 1);
+                assert_eq!(read_differs(0, pieces as usize), vec![0; pieces as usize]);
+            }
+
+            // Every lane `0..64` in piece 1, dispatched with `first = 1` and `out_at = 4`.
+            let piece1_lo = (PIECE - SKEW as usize) & !15;
+            for lane in 0..64usize {
+                let at = piece1_lo + lane * 16 + (lane % 16);
+                clear_differs();
+                run(1, SKEW, size as u32, 3, 4, 1);
+                assert_eq!(read_differs(1, 3), vec![0, 0, 0]);
+                flip(at, 0x80);
+                run(1, SKEW, size as u32, 3, 4, 1);
+                assert_eq!(read_differs(1, 3), vec![1, 0, 0], "piece 1 lane {lane} (at {at})");
+                flip(at, 0x80);
+            }
+
+            // Simultaneous identical MSB flips in paired lanes on the final 1024-byte stride of piece 2.
+            let piece2_hi = ((3 * PIECE - SKEW as usize) + 15) & !15;
+            let last_stride = piece2_hi - 1024;
+            for (a, b) in [(0usize, 32usize), (0, 16), (0, 1)] {
+                flip(last_stride + a * 16 + 3, 0x80);
+                flip(last_stride + b * 16 + 3, 0x80);
+                run(0, SKEW, size as u32, pieces, 0, 1);
+                assert_eq!(read_differs(0, pieces as usize), vec![0, 0, 1, 0, 0], "paired lanes ({a}, {b})");
+                flip(last_stride + a * 16 + 3, 0x80);
+                flip(last_stride + b * 16 + 3, 0x80);
+                run(0, SKEW, size as u32, pieces, 0, 1);
+                assert_eq!(read_differs(0, pieces as usize), vec![0; pieces as usize]);
+            }
+
+            // Tail piece (piece 4) end byte with `compare = 2` (flag once, then update stored hash).
+            flip(size - 1, 0x40);
+            run(0, SKEW, size as u32, pieces, 0, 2);
+            assert_eq!(read_differs(0, pieces as usize), vec![0, 0, 0, 0, 1]);
+            run(0, SKEW, size as u32, pieces, 0, 2);
+            assert_eq!(read_differs(0, pieces as usize), vec![0; pieces as usize]);
+        };
+
+        if let Some(mut warp) = WarpHarness::new() {
+            let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("card compare compiles on WARP");
+            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(pieces));
+            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+            assert_clean_debug(&warp.device);
+            let mut run_warp = |first: u32, skew: u32, sz: u32, count: u32, out_at: u32, mode: u32| {
+                // SAFETY: open command list, live buffers, compare root signature.
+                unsafe {
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    let constants = [first, skew, sz, count, out_at, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    warp.list.Dispatch(count.min(65535), 1, 1);
+                }
+                warp.submit_and_wait();
+            };
+            exercise(now_ptr, differs_ptr.cast::<u32>(), &mut run_warp);
+            assert_clean_debug(&warp.device);
+        }
+
+        if let Some(host) = super::host() {
+            let _ = host.log_messages();
+            assert_clean_debug(&host.device);
+            let Ok(list) = host.new_list() else {
+                return;
+            };
+            let Some((now_buf, now_ptr)) = host.shared_buffer(size as u64) else {
+                return;
+            };
+            let Some((hashes_buf, _)) = host.shared_buffer(16 * u64::from(pieces)) else {
+                return;
+            };
+            let Some((differs_buf, differs_ptr)) = host.shared_buffer(64) else {
+                return;
+            };
+            let compare = compile_cs(&host.device, crate::host::CARD_COMPARE).expect("card compare compiles on host GPU");
+            // SAFETY: live buffers.
+            let (now_gpu, hashes_gpu, differs_gpu) = unsafe {
+                (
+                    now_buf.GetGPUVirtualAddress(),
+                    hashes_buf.GetGPUVirtualAddress(),
+                    differs_buf.GetGPUVirtualAddress(),
+                )
+            };
+            let mut run_host = |first: u32, skew: u32, sz: u32, count: u32, out_at: u32, mode: u32| {
+                // SAFETY: open host list, live buffers, compare root signature.
+                unsafe {
+                    list.list.SetComputeRootSignature(&compare.root);
+                    list.list.SetPipelineState(&compare.pso);
+                    let constants = [first, skew, sz, count, out_at, mode];
+                    list.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    list.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    list.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    list.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    list.list.Dispatch(count.min(65535), 1, 1);
+                }
+                list.close();
+                assert_clean_debug(&host.device);
+                host.execute(&[&list]);
+                list.reset();
+                assert_clean_debug(&host.device);
+            };
+            exercise(now_ptr, differs_ptr.cast::<u32>(), &mut run_host);
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

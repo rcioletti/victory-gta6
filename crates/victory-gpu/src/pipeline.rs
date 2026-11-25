@@ -64,6 +64,7 @@ pub fn warm(stage: &'static str, container: &[u8]) -> bool {
         hash: blake3::hash(container).to_hex()[..16].to_owned(),
         container: container.to_vec(),
         translated: OnceLock::new(),
+        walks: OnceLock::new(),
     };
     shader.translated().is_some()
 }
