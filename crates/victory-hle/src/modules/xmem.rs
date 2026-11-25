@@ -673,12 +673,15 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
-    let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
+    // into that gap (`victory_gpu::title_memory_remapping`). Acquire `MAPPING`
+    // before `PHYSICAL` to match `victory_gpu::queue::map_batches`
+    // (`VICTORY_REMAP_BATCH=1`) and avoid blocking `PHYSICAL` while waiting for
+    // in-place reads to finish.
     let _changing = victory_gpu::title_memory_remapping();
+    let mut physical = physical();
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -745,9 +748,10 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
-    let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+    // As in `XMemMapPhysicalPages`: acquire `MAPPING` before `PHYSICAL` to
+    // keep strict lock order with batch remaps (`VICTORY_REMAP_BATCH=1`).
     let _changing = victory_gpu::title_memory_remapping();
+    let mut physical = physical();
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1455,5 +1459,32 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn batch_remap_and_physical_mapping_never_deadlock() {
+        let pages = allocate(2);
+        let reserve = || {
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!at.is_null());
+            at
+        };
+        let (a, b) = (reserve(), reserve());
+        assert_eq!(XMemMapPhysicalPages(a, 1, &pages[0]), a);
+        let (a_addr, b_addr) = (a as u64, b as u64);
+        let worker = std::thread::spawn(move || {
+            for _ in 0..500 {
+                let _held = victory_gpu::title_memory_remapping();
+                assert!(map_alias(b_addr, a_addr, PAGE as u64));
+                assert!(map_alias(b_addr, 0, PAGE as u64));
+            }
+        });
+        for i in 0..500 {
+            let page = pages[i % 2];
+            assert_eq!(XMemMapPhysicalPages(a, 1, &page), a);
+        }
+        worker.join().unwrap();
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
