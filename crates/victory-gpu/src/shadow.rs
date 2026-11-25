@@ -151,17 +151,28 @@ pub(crate) fn cards() -> bool {
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
+/// Pure helper for [`card_limits`]: parses an optional KiB override and MiB
+/// defaults, clamping the minimum to at least one 64 KiB `PIECE`.
+fn card_limits_from(min_kb: Option<u64>, min_mb: Option<u64>, max_mb: Option<u64>) -> (u64, u64) {
+    let least = match min_kb {
+        Some(kb) => (kb << 10).max(64 << 10),
+        None => (min_mb.unwrap_or(1) << 20).max(1 << 20),
+    };
+    let most = max_mb.unwrap_or(1024) << 20;
+    (least, most)
+}
+
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+        let parse = |name: &str| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok())
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        card_limits_from(
+            parse("VICTORY_CARD_BUFFERS_MIN_KB"),
+            parse("VICTORY_CARD_BUFFERS_MIN_MB"),
+            parse("VICTORY_CARD_BUFFERS_MB"),
+        )
     })
 }
 
@@ -389,6 +400,22 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
+/// Clamps the percentage of the card's VRAM budget allowed for card-side
+/// loose windows (`50..=95`, default `80`).
+fn clamp_window_budget_pct(pct: Option<u64>) -> u64 {
+    pct.unwrap_or(80).clamp(50, 95)
+}
+
+fn window_card_budget_pct() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        let raw = std::env::var("VICTORY_CARD_WINDOWS_BUDGET_PCT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        clamp_window_budget_pct(raw)
+    })
+}
+
 /// Whether a window of `size` bytes may go to the card's memory
 /// ([`window_card_most`], the card's room); if so its bytes are counted
 /// there from now, and the caller makes the buffer (or takes them off
@@ -420,8 +447,9 @@ fn window_card_room(size: u64, how: &str) -> bool {
             );
         }
     };
+    let pct = window_card_budget_pct();
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * pct
     {
         say(1, "no room on the card for");
         return false;
@@ -2535,6 +2563,19 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// As [`Shadow::refresh`], for several spans of one list: the spans are
+    /// clamped as `refresh` clamps them, and all their steps go in under one
+    /// lock of the list (`HostList::defer_refreshes`).
+    pub(crate) fn refresh_many<'a>(
+        list: &HostList,
+        spans: impl IntoIterator<Item = (&'a Arc<Shadow>, u64, u64)>,
+    ) {
+        list.defer_refreshes(spans.into_iter().map(|(shadow, address, len)| {
+            let len = len.min(shadow.start + shadow.len - address);
+            (shadow, address as usize, len as usize)
+        }));
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
@@ -3725,15 +3766,24 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+///
+/// Read most of the time (every ask, from every recording thread, finds its
+/// copy here); written only when a buffer is registered or released, and
+/// when a copy is made on first use, so the asks share the read lock.
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    buffers_write().insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -3744,14 +3794,14 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    buffers_write().remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -3777,7 +3827,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers();
+        let mut map = buffers_write();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
@@ -3795,7 +3845,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
@@ -3835,7 +3885,26 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
+    // Fast path: the buffer found has its copy already (all but the first
+    // ask for a buffer), so the ask only needs the read lock.
+    let needs_copy = {
+        let map = buffers_read();
+        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+            Some((_, entry)) => match &entry.shadow {
+                Some(shadow) => return Some(shadow.clone()),
+                // The entry exists but its copy is not made yet: drop the
+                // read lock and make it under the write lock.
+                None => true,
+            },
+            None => false,
+        }
+    };
+    if !needs_copy {
+        return loose(address, end, len <= 1, any);
+    }
+    // Slow path, under the write lock: the copy is made once. A second
+    // thread that raced here finds it made and only clones it.
+    let mut map = buffers_write();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -4339,6 +4408,22 @@ mod window_tests {
             assert!(start % g == 0 && len % g == 0);
         }
     }
+
+    #[test]
+    fn card_limits_and_budget_pct_parse_and_clamp() {
+        use super::{card_limits_from, clamp_window_budget_pct};
+        // Unset falls back to 1 MiB / 1024 MiB.
+        assert_eq!(card_limits_from(None, None, None), (1 << 20, 1024 << 20));
+        // KiB minimum overrides MB minimum and clamps to one 64 KiB piece.
+        assert_eq!(card_limits_from(Some(16), Some(4), Some(2048)), (64 << 10, 2048 << 20));
+        assert_eq!(card_limits_from(Some(64), None, Some(2048)), (64 << 10, 2048 << 20));
+        assert_eq!(card_limits_from(Some(256), None, None), (256 << 10, 1024 << 20));
+        // Window budget pct defaults to 80 and clamps to 50..=95.
+        assert_eq!(clamp_window_budget_pct(None), 80);
+        assert_eq!(clamp_window_budget_pct(Some(10)), 50);
+        assert_eq!(clamp_window_budget_pct(Some(90)), 90);
+        assert_eq!(clamp_window_budget_pct(Some(100)), 95);
+    }
 }
 
 #[cfg(test)]
@@ -4441,7 +4526,7 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
